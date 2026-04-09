@@ -1,6 +1,6 @@
 # Gut Microbiome — NCBI Data Download Pipeline
 
-Two scripts to collect BioProject metadata and download SRA sequencing data from NCBI.
+Scripts to fetch SRA run metadata from NCBI and download FASTQ files.
 
 ---
 
@@ -8,10 +8,10 @@ Two scripts to collect BioProject metadata and download SRA sequencing data from
 
 1. [Prerequisites](#1-prerequisites)
 2. [Quick Start](#2-quick-start)
-3. [Step 1 — Fetch Project Metadata](#3-step-1--fetch-project-metadata)
-4. [Step 2 — Download SRA FASTQ](#4-step-2--download-sra-fastq)
-5. [Output Files](#5-output-files)
-6. [seq_type Groups](#6-seq_type-groups)
+3. [Workflow A — By Taxon ID (large-scale)](#3-workflow-a--by-taxon-id-large-scale)
+4. [Workflow B — By BioProject (single project)](#4-workflow-b--by-bioproject-single-project)
+5. [Step 3 — Download & Parse](#5-step-3--download--parse)
+6. [Output Files](#6-output-files)
 7. [Taxon ID Reference](#7-taxon-id-reference)
 8. [Troubleshooting](#8-troubleshooting)
 
@@ -25,23 +25,24 @@ Two scripts to collect BioProject metadata and download SRA sequencing data from
 pip install biopython pandas requests tqdm
 ```
 
-### SRA Toolkit (Step 2 only)
+### SRA Toolkit
+
+Required for `03_download_parse_prefetch.py`.
 
 ```bash
-# conda
-conda install -c bioconda -c conda-forge sra-tools
+# conda (recommended)
+conda install -c bioconda sra-tools
 
 # macOS Homebrew
 brew install sratoolkit
 ```
 
 > Use SRA Toolkit **v3.x or newer**. Older versions have SSL issues with `prefetch`.
-> If you cannot upgrade, use the `--no-prefetch` flag.
 
-Run once after installation:
+Run once after installation to accept defaults:
 
 ```bash
-vdb-config -i    # accept defaults and save
+vdb-config -i
 ```
 
 ---
@@ -49,42 +50,46 @@ vdb-config -i    # accept defaults and save
 ## 2. Quick Start
 
 ```bash
-# Step 1 — collect metadata
-python fetch_project.py \
-    --taxon-id 1510822 \
-    --email    your@email.com
-
-# Step 2 — preview runs (no download)
-python download_sra.py \
-    --accessions PRJNA857725 \
-    --email      your@email.com \
-    --dry-run
-
-# Step 2 — download
-python download_sra.py \
-    --accessions PRJNA857725 \
-    --email      your@email.com \
+# Workflow A — fetch metadata by taxon ID, then download
+python sra_fetch.py --taxon-id 1510822 --email your@email.com
+python 03_download_parse_prefetch.py \
+    --accessions runs.txt \
+    --reference  sra_taxid1510822.csv \
     --outdir     ./fastq \
-    --threads    8
+    --parsed     parsed_metadata.csv \
+    --curator    "Jason"
+
+# Workflow B — fetch metadata for one BioProject, then download
+python 01_fetch_sra_metadata.py --accession PRJNA857725 --email your@email.com
+python 03_download_parse_prefetch.py \
+    --accessions runs.txt \
+    --reference  PRJNA857725_sra_runs.csv \
+    --outdir     ./fastq \
+    --parsed     parsed_metadata.csv \
+    --curator    "Jason"
 ```
 
 ---
 
-## 3. Step 1 — Fetch Project Metadata
+## 3. Workflow A — By Taxon ID (large-scale)
 
-**Script:** `fetch_project.py`
+**Script:** `sra_fetch.py`
 
-Searches NCBI BioProject by taxon ID and builds a metadata table (CSV + JSON).
-Each project is automatically grouped by sequence type and labelled by BioSample count.
+Searches the entire SRA database by NCBI Taxon ID. Returns all runs with
+`LibraryStrategy = WGS` or `METAGENOMIC`, merged with BioSample attributes.
 
 ### Usage
 
 ```bash
-# Pig gut
-python fetch_project.py --taxon-id 1510822 --email your@email.com
+python sra_fetch.py \
+    --taxon-id 1510822 \
+    --email    your@email.com
 
-# Human gut (large dataset — checkpoint/resume enabled)
-python fetch_project.py --taxon-id 408170 --email your@email.com --label human_gut
+# With NCBI API key (raises rate limit 3 → 10 req/s, recommended for large taxons)
+python sra_fetch.py \
+    --taxon-id 1510822 \
+    --email    your@email.com \
+    --api-key  YOUR_NCBI_API_KEY
 ```
 
 ### Arguments
@@ -93,127 +98,218 @@ python fetch_project.py --taxon-id 408170 --email your@email.com --label human_g
 |------|----------|---------|-------------|
 | `--taxon-id` | Yes | — | NCBI Taxon ID |
 | `--email` | Yes | — | Your email (NCBI policy) |
-| `--label` | No | `projects_taxid<ID>` | Output filename prefix |
+| `--label` | No | `sra_taxid<ID>` | Output filename prefix |
+| `--api-key` | No | None | NCBI API key for higher rate limits |
 
-### Output columns
+### Output
 
-| Column | Description |
-|--------|-------------|
-| `bioproject_id` | NCBI accession (e.g. PRJNA123456) |
-| `title` | Project title |
-| `description` | Full description |
-| `project_data_type` | metagenome / raw sequence reads / etc. |
-| `organism_name` | Target organism |
-| `taxon_id` | NCBI Taxon ID |
-| `biosample_count` | Number of linked BioSamples |
-| `above_avg_biosample` | `above_avg` or `below_avg` (threshold = mean of "Other" group) |
-| `sra_library_strategies` | Pipe-separated SRA library types (e.g. `AMPLICON\|WGS`) |
-| `seq_type` | Auto-assigned group: `16S`, `Amplicon`, `RNA`, or `Other` |
-| `registration_date` | Date registered with NCBI |
-| `pubmed_ids` | Linked PubMed IDs |
-| `relevance` | NCBI domain tag (e.g. Agricultural, Medical) |
+| File | Description |
+|------|-------------|
+| `sra_taxid1510822.csv` | All WGS/METAGENOMIC runs with BioSample attributes |
 
 ### Notes
 
-- **Checkpoint/resume:** progress is saved to `<label>_checkpoint.json` after every
-  batch. If the script crashes, re-run the same command to continue from where it stopped.
-- **`above_avg_biosample`:** threshold is the mean biosample_count of the `Other`
-  group only (WGS / metagenomics). All projects are then labelled `above_avg` or
-  `below_avg` against this threshold.
-
-### Expected runtime
-
-| Taxon | Projects | Approx. time |
-|-------|----------|-------------|
-| Pig gut (1510822) | ~1,100 | 15–20 min |
-| Human gut (408170) | ~5,900 | 90–120 min |
+- **Checkpoint/resume:** saved to `<label>_checkpoint.json` after every batch.
+  Re-run the same command to resume after a crash.
+- Filtered to `WGS` and `METAGENOMIC` strategies only.
+- BioSample attributes (geo_loc_name, host, collection_date, etc.) are merged automatically.
 
 ---
 
-## 4. Step 2 — Download SRA FASTQ
+## 4. Workflow B — By BioProject (single project)
 
-**Script:** `download_sra.py`
+**Script:** `01_fetch_sra_metadata.py`
 
-Takes one or more BioProject accessions, finds all **METAGENOMIC** and **WGS**
-runs, saves run metadata to a CSV, then downloads FASTQ files.
+Fetches the full SRA run metadata for a single BioProject or SRA Study accession,
+matching the output of the NCBI SRA Run Selector page.
 
 ### Usage
 
 ```bash
-# Dry run — list runs and save metadata, no download
-python download_sra.py \
-    --accessions PRJNA857725 \
-    --email      your@email.com \
-    --dry-run
+python 01_fetch_sra_metadata.py \
+    --accession PRJNA857725 \
+    --email     your@email.com
 
-# Download multiple BioProjects
-python download_sra.py \
-    --accessions PRJNA857725 PRJNA123456 \
-    --email      your@email.com \
-    --outdir     ./fastq \
-    --threads    8
-
-# If prefetch has SSL errors, bypass it
-python download_sra.py \
-    --accessions PRJNA857725 \
-    --email      your@email.com \
-    --no-prefetch
+# Custom output filename
+python 01_fetch_sra_metadata.py \
+    --accession PRJNA857725 \
+    --email     your@email.com \
+    --out       pig_gut_runs.csv
 ```
 
 ### Arguments
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--accessions` | Yes | — | One or more BioProject accessions |
-| `--email` | Yes | — | Your email (NCBI policy) |
-| `--outdir` | No | `sra_downloads` | Output directory for FASTQ files |
-| `--threads` | No | `4` | Threads for `fasterq-dump` |
-| `--max-runs` | No | None | Limit runs downloaded (for testing) |
-| `--dry-run` | No | False | Preview without downloading |
-| `--no-prefetch` | No | False | Skip `prefetch`, stream directly via `fasterq-dump` |
+| `--accession` | Yes | — | BioProject (PRJNA…) or SRA Study (SRP…) accession |
+| `--email` | No | None | Your email (recommended for NCBI) |
+| `--out` | No | `<accession>_sra_runs.csv` | Output CSV filename |
+
+### Output columns (selected)
+
+| Column | Description |
+|--------|-------------|
+| `Run` | SRR accession |
+| `BioProject` | BioProject accession |
+| `BioSample` | BioSample accession |
+| `LibraryStrategy` | WGS, METAGENOMIC, AMPLICON, etc. |
+| `LibraryLayout` | PAIRED or SINGLE |
+| `Platform` | ILLUMINA, PACBIO, etc. |
+| `spots` | Number of reads |
+| `bases` | Total base pairs |
+| `geo_loc_name` | Collection location (from BioSample) |
+| `host` | Host organism (from BioSample) |
+| `collection_date` | Sample collection date (from BioSample) |
 
 ### Notes
 
-- Only runs with `LibraryStrategy` = `METAGENOMIC` or `WGS` are downloaded.
-- Already-downloaded runs are skipped automatically — safe to re-run.
-- `sra_metadata.csv` is saved before any download starts.
-- Failed runs are written to `failed_runs.txt` for easy retry.
+- Equivalent to downloading the metadata table from
+  `https://www.ncbi.nlm.nih.gov/Traces/study/`
+- Includes all BioSample attributes (geo_loc_name, host, collection_date, etc.).
+
+### Prepare accession list for download
+
+After fetching metadata, create the `runs.txt` input for the download step:
+
+```bash
+# All runs in the project
+tail -n +2 PRJNA857725_sra_runs.csv | cut -d',' -f1 > runs.txt
+
+# WGS/METAGENOMIC runs only
+python -c "
+import pandas as pd
+df = pd.read_csv('PRJNA857725_sra_runs.csv')
+mask = df['LibraryStrategy'].str.upper().isin({'WGS','METAGENOMIC'})
+df.loc[mask, 'Run'].to_csv('runs.txt', index=False, header=False)
+"
+```
 
 ---
 
-## 5. Output Files
+## 5. Step 3 — Download & Parse
+
+**Script:** `03_download_parse_prefetch.py`
+
+Downloads SRA runs using `prefetch` + `fasterq-dump`, verifies files on disk,
+and builds a curated metadata CSV. Designed for multi-batch use — the output
+parsed file is safely updated across multiple runs.
+
+### Usage
+
+```bash
+# Preview commands without downloading
+python 03_download_parse_prefetch.py \
+    --accessions runs.txt \
+    --reference  sra_taxid1510822.csv \
+    --outdir     ./fastq \
+    --parsed     parsed_metadata.csv \
+    --curator    "Jason" \
+    --dry-run
+
+# Download
+python 03_download_parse_prefetch.py \
+    --accessions runs.txt \
+    --reference  sra_taxid1510822.csv \
+    --outdir     ./fastq \
+    --parsed     parsed_metadata.csv \
+    --curator    "Jason" \
+    --threads    8 \
+    --max-size   100
+```
+
+### Arguments
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--accessions` | Yes | — | Text file with one SRR accession per line |
+| `--reference` | Yes | — | Reference CSV from `sra_fetch.py` or `01_fetch_sra_metadata.py` |
+| `--outdir` | Yes | — | Root output directory |
+| `--parsed` | No | `parsed_metadata.csv` | Curated output CSV (appended across batches) |
+| `--curator` | Yes | — | Your name, recorded in `Zlab_curator` column |
+| `--threads` | No | `8` | Threads for `fasterq-dump` |
+| `--max-size` | No | `50` | Max SRA file size in GB for `prefetch` |
+| `--dry-run` | No | False | Print commands without downloading |
+
+### Download structure
+
+```
+fastq/
+└── PRJNA857725/
+    ├── SRR21388550_1.fastq.gz    # paired forward
+    ├── SRR21388550_2.fastq.gz    # paired reverse
+    └── SRR21388551.fastq.gz      # single-end
+```
+
+### Pipeline steps
+
+| Step | Description |
+|------|-------------|
+| 1 | Load reference CSV + accession list |
+| 2 | Group SRRs by BioProject; run `prefetch` → `fasterq-dump` → `gzip` |
+| 3 | Verify FASTQ files exist on disk; write `failed_runs.txt` if any failed |
+| 4 | Extract metadata for confirmed downloads from reference CSV |
+| 5 | Drop all-blank columns; add 5 Zlab curation columns |
+| 6 | Append to parsed CSV (deduplication by Run, multi-batch safe) |
+| 7 | Update reference CSV in-place with Zlab columns |
+
+### Zlab columns added
+
+| Column | Description |
+|--------|-------------|
+| `Zlab_sort` | Manual sort order (default `1`) |
+| `Zlab_SRA_path` | Local path to BioProject FASTQ directory |
+| `Zlab_metadata_path` | Path to additional metadata (fill manually if needed) |
+| `Zlab_curator` | Curator name (from `--curator`) |
+| `Zlab_curated_date` | Date of download (ISO format, auto-filled) |
+
+### Multi-batch usage
+
+Run the script multiple times with different `runs.txt` files.
+The parsed file accumulates — each batch's records are merged by `Run` accession.
+
+```bash
+python 03_download_parse_prefetch.py --accessions batch1.txt ...
+python 03_download_parse_prefetch.py --accessions batch2.txt ...
+# parsed_metadata.csv now contains all confirmed runs from both batches
+```
+
+### Retry failed downloads
+
+```bash
+# Re-run using the failed list as the next accession input
+python 03_download_parse_prefetch.py \
+    --accessions fastq/failed_runs.txt \
+    --reference  sra_taxid1510822.csv \
+    --outdir     ./fastq \
+    --parsed     parsed_metadata.csv \
+    --curator    "Jason"
+```
+
+---
+
+## 6. Output Files
 
 ```
 pig_dataset/
-├── fetch_project.py
-├── download_sra.py
-├── README.md
+├── sra_fetch.py
+├── 01_fetch_sra_metadata.py
+├── 03_download_parse_prefetch.py
 │
-├── projects_taxid1510822.csv      # BioProject metadata table
-├── projects_taxid1510822.json
+├── sra_taxid1510822.csv          # All WGS/METAGENOMIC runs by taxon ID
+├── PRJNA857725_sra_runs.csv      # Runs for a single BioProject (Workflow B)
+│
+├── parsed_metadata.csv           # Curated metadata for all downloaded runs
+│                                 # (appended across batches, includes Zlab columns)
 │
 └── fastq/
-    ├── sra_metadata.csv           # Run-level metadata for all downloaded runs
-    ├── SRR21388550_1.fastq        # Forward reads (paired)
-    ├── SRR21388550_2.fastq        # Reverse reads (paired)
-    ├── SRR21388551.fastq          # Single-end reads
-    └── failed_runs.txt            # Failed accessions (if any)
+    ├── failed_runs.txt           # Failed SRR accessions (if any)
+    ├── PRJNA857725/
+    │   ├── SRR21388550_1.fastq.gz
+    │   ├── SRR21388550_2.fastq.gz
+    │   └── SRR21388551.fastq.gz
+    └── PRJNA123456/
+        └── SRR99999999.fastq.gz
 ```
-
----
-
-## 6. seq_type Groups
-
-Keyword matching on project title + description:
-
-| seq_type | Keyword matched | Typical studies |
-|----------|----------------|----------------|
-| `16S` | "16S" | 16S rRNA amplicon |
-| `Amplicon` | "Amplicon" / "amplicon" | ITS, 18S, other amplicons |
-| `RNA` | "RNA", "RNA-Seq", "metatranscriptom" | Metatranscriptomics |
-| `Other` | none of the above | Shotgun metagenomics, WGS |
-
-A project gets multiple labels (pipe-joined) if it matches more than one rule.
 
 ---
 
@@ -234,12 +330,12 @@ Find any taxon: https://www.ncbi.nlm.nih.gov/taxonomy
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `HTTP Error 400` | Empty `api_key` string | Set to `None` or a valid key |
-| `RuntimeError: EOF` | NCBI dropped connection | Script retries automatically (5×) |
-| `biosample_count = 0` | Wrong elink linkname | Must use `bioproject_biosample_all` |
+| `HTTP Error 400` in sra_fetch.py | Empty `api_key` string passed | Set to `None` or provide a valid key |
+| `RuntimeError: EOF` | NCBI dropped connection mid-request | Script retries automatically (5×) |
+| `IncompleteRead` | Connection reset during transfer | Re-run — checkpoint resumes progress |
 | `fasterq-dump not found` | SRA Toolkit not installed | `conda install -c bioconda sra-tools` |
-| `IncompleteRead` | Connection reset mid-transfer | Re-run — checkpoint resumes progress |
-| `PackagesNotFoundError` | Exact version not available | Remove version pin: `conda install -c bioconda sra-tools` |
+| `PackagesNotFoundError` | Exact version unavailable | Remove version pin: `conda install -c bioconda sra-tools` |
+| `No data returned` in 01 script | Invalid or private accession | Check accession exists and has public data |
 
 ### prefetch SSL error
 
@@ -247,18 +343,32 @@ Find any taxon: https://www.ncbi.nlm.nih.gov/taxonomy
 mbedtls_ssl_handshake returned -9984 — Certificate verification failed
 ```
 
-```bash
-# Option 1: upgrade SRA Toolkit
-conda install -c bioconda -c conda-forge sra-tools
-
-# Option 2: bypass prefetch (immediate workaround)
-python download_sra.py --accessions PRJNA857725 --email you@email.com --no-prefetch
-```
-
-### Retry failed downloads
+Cause: SRA Toolkit older than v3.x uses an outdated TLS library.
 
 ```bash
-while read srr; do
-    fasterq-dump "$srr" --outdir ./fastq --split-files --threads 4
-done < fastq/failed_runs.txt
+# Upgrade SRA Toolkit
+conda install -c bioconda sra-tools
 ```
+
+### prefetch file too large
+
+```
+This file is larger than the maximum allowed: 20,971,520,000
+```
+
+```bash
+# Increase the limit with --max-size (in GB)
+python 03_download_parse_prefetch.py ... --max-size 100
+```
+
+### fasterq-dump temp space
+
+`fasterq-dump` writes large temporary files during conversion. If your disk is full:
+
+```bash
+# Point temp files to a larger disk
+fasterq-dump SRR.sra --outdir ./fastq --temp /path/to/large/disk/tmp
+```
+
+For batch use, set the `--temp` flag by editing `FASTERQ_THREADS` / `cmd_fq` in
+`03_download_parse_prefetch.py` line ~115.
