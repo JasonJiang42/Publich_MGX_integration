@@ -2,18 +2,18 @@
 """
 MGX_data.py
 ────────────
-Four subcommands for SRA metagenomics data management:
+Three subcommands for SRA metagenomics data management:
 
-  fetch-taxon    Fetch all WGS/METAGENOMIC SRA runs for a taxon ID.
-  fetch-project  Fetch full SRA run metadata for one BioProject/Study.
-  download       Download SRA runs via prefetch + fasterq-dump.
-  parse          Scan downloaded FASTQ files and update metadata CSVs.
+  fetch-data  Fetch SRA run metadata by taxon ID(s) and/or BioProject accession(s).
+  download    Download SRA runs via prefetch + fasterq-dump.
+  parse       Scan downloaded FASTQ files and update metadata CSVs.
 
 Usage:
-    python MGX_data.py fetch-taxon   --taxon-id 1510822 --email you@email.com
-    python MGX_data.py fetch-project --accession PRJNA857725 --email you@email.com
-    python MGX_data.py download      --accessions runs.csv --outdir ./fastq
-    python MGX_data.py parse         --reference sra_taxid1510822.csv --outdir ./fastq
+    python MGX_data.py fetch-data --taxon 1510822 --email you@email.com
+    python MGX_data.py fetch-data --bioproject PRJNA857725 PRJNA123456
+    python MGX_data.py fetch-data --taxon 1510822 --bioproject PRJNA857725 --email you@email.com
+    python MGX_data.py download   --accessions runs.csv --outdir ./fastq
+    python MGX_data.py parse      --reference sra_taxid1510822.csv --outdir ./fastq
 
 Run with -h for full argument list:
     python MGX_data.py <command> -h
@@ -30,6 +30,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,9 +49,11 @@ PREFETCH_MAX_GB  = 50
 ESEARCH_BATCH    = 5000   # UIDs per esearch page
 RUNINFO_BATCH    = 200    # UIDs per efetch runinfo call
 BIOSAMPLE_BATCH  = 100    # accessions per BioSample efetch call
+ESUMMARY_BATCH   = 200    # UIDs per esummary call (BioProject UID → accession)
 
 EFETCH_URL       = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 ESEARCH_URL      = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+ESUMMARY_URL     = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 BIOSAMPLE_URL    = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 SRA_RUNS_URL     = "https://trace.ncbi.nlm.nih.gov/Traces/sra-db-be/runs"
 
@@ -134,23 +137,22 @@ def fetch_biosample_attributes(biosample_accs: list[str]) -> pd.DataFrame:
 
 def load_accessions_two_col(path: str) -> pd.DataFrame:
     """
-    Load a two-column accessions file (Run, BioProject).
-    Accepts comma or tab separation, with or without a header row.
+    Load a plain-text two-column accessions file (no header).
+    Column 1: SRA run accession (SRR/ERR/DRR).
+    Column 2: BioProject accession.
+    Accepts tab or comma as separator.
     """
-    for sep in (",", "\t"):
-        df = pd.read_csv(path, sep=sep, dtype=str, header=None)
-        if df.shape[1] >= 2:
-            break
-    else:
-        sys.exit(f"[ERROR] Cannot parse {path} as two-column.\n"
-                 "  Expected: Run,BioProject (comma or tab separated)")
-
-    df = df.iloc[:, :2].copy()
-    df.columns = ["Run", "BioProject"]
-    first = str(df.iloc[0, 0]).strip().upper()
-    if not (first.startswith("SRR") or first.startswith("ERR") or first.startswith("DRR")):
-        df = df.iloc[1:].reset_index(drop=True)
-    return df.dropna().reset_index(drop=True)
+    for sep in ("\t", ","):
+        try:
+            df = pd.read_csv(path, sep=sep, dtype=str, header=None)
+            if df.shape[1] >= 2:
+                df = df.iloc[:, :2].copy()
+                df.columns = ["Run", "BioProject"]
+                return df.dropna().reset_index(drop=True)
+        except Exception:
+            continue
+    sys.exit(f"[ERROR] Cannot parse {path} as two-column.\n"
+             "  Expected: SRR_accession<tab or comma>BioProject  (no header)")
 
 
 def load_accessions_any(path: str) -> list[str]:
@@ -167,6 +169,26 @@ def load_accessions_any(path: str) -> list[str]:
         return [line.strip() for line in fh if line.strip()]
 
 
+def load_bioproject_list(values: list[str]) -> list[str]:
+    """
+    Resolve --bioproject values to a flat list of accession strings.
+
+    If exactly one value is given and it is an existing file path,
+    accessions are read from that plain-text file (one accession per line;
+    blank lines and comment lines starting with '#' are ignored).
+    Otherwise the values are returned as-is (direct accessions on the
+    command line).
+    """
+    if len(values) == 1 and Path(values[0]).is_file():
+        path = values[0]
+        with open(path) as fh:
+            accs = [ln.strip() for ln in fh
+                    if ln.strip() and not ln.startswith("#")]
+        print(f"  Loaded {len(accs):,} BioProject accessions from {path}")
+        return accs
+    return values
+
+
 def is_downloaded(srr: str, bioproject_dir: Path) -> bool:
     """Return True if any FASTQ file exists in <bioproject_dir>/<srr>/."""
     srr_dir = bioproject_dir / srr
@@ -176,18 +198,56 @@ def is_downloaded(srr: str, bioproject_dir: Path) -> bool:
     )
 
 
+def scan_downloaded_srrs(location: Path) -> dict[str, str]:
+    """
+    Walk <location>/<BioProject>/<SRR>/ and return {SRR: BioProject}
+    for every run that has FASTQ files present on disk.
+    """
+    result: dict[str, str] = {}
+    if not location.is_dir():
+        return result
+    for bp_dir in sorted(location.iterdir()):
+        if not bp_dir.is_dir():
+            continue
+        for srr_dir in sorted(bp_dir.iterdir()):
+            if not srr_dir.is_dir():
+                continue
+            srr = srr_dir.name
+            if is_downloaded(srr, bp_dir):
+                result[srr] = bp_dir.name
+    return result
+
+
 def save_csv_merge(df_new: pd.DataFrame, path: str) -> int:
     """
     Write df_new to path. If path already exists, merge by outer-joining
-    columns and deduplicating on 'Run' (keep latest). Returns total row count.
+    columns and deduplicating on 'Run' (keep latest).
+
+    Column order: [existing columns] + [new columns only (not in existing)]
+    Returns total row count.
     """
     p = Path(path)
     if p.exists():
-        df_existing = pd.read_csv(p, dtype=str)
-        df_combined = pd.concat([df_existing, df_new.astype(str)], ignore_index=True)
+        df_existing = pd.read_csv(p, dtype=str, skip_blank_lines=True)
+        df_new_copy = df_new.astype(str)
+
+        # Identify old vs new columns
+        old_cols = list(df_existing.columns)
+        new_cols = [c for c in df_new_copy.columns if c not in old_cols]
+
+        # Merge and deduplicate
+        df_combined = pd.concat([df_existing, df_new_copy], ignore_index=True)
         df_combined = (df_combined
                        .drop_duplicates(subset=["Run"], keep="last")
-                       .reset_index(drop=True))
+                       .reset_index(drop=True)
+                       .dropna(how="all"))  # Drop rows that are completely empty
+
+        # Reorder columns: existing first, then new at the end
+        col_order = old_cols + new_cols
+        df_combined = df_combined[col_order]
+
+        # Fill NaN with empty string
+        df_combined = df_combined.fillna("")
     else:
         df_combined = df_new.astype(str)
     df_combined.to_csv(path, index=False)
@@ -208,11 +268,22 @@ def reorder_zlab_first(df: pd.DataFrame) -> pd.DataFrame:
     return df[present_zlab + (["Run"] if has_run else []) + other_cols]
 
 
-def check_tools(no_prefetch: bool = False) -> None:
-    tools = ["fasterq-dump", "gzip"] if no_prefetch else ["prefetch", "fasterq-dump", "gzip"]
+def check_tools(no_prefetch: bool = False, iseq: bool = False) -> None:
+    if iseq:
+        tools = ["iseq"]
+    elif no_prefetch:
+        tools = ["fasterq-dump", "gzip"]
+    else:
+        tools = ["prefetch", "fasterq-dump", "gzip"]
     missing = [t for t in tools
                if subprocess.run(["which", t], capture_output=True).returncode != 0]
     if missing:
+        if iseq:
+            sys.exit(
+                f"[ERROR] Tool not found on PATH: {', '.join(missing)}\n"
+                "  Install iSeq:  conda install bioconda::iseq\n"
+                "  Source:        https://github.com/BioOmics/iSeq"
+            )
         sys.exit(
             f"[ERROR] Tool(s) not found on PATH: {', '.join(missing)}\n"
             "  Install SRA Toolkit: "
@@ -259,19 +330,100 @@ def _search_sra_uids(taxon_id: str, api_key: str | None) -> list[str]:
     return uids
 
 
+def _search_bioproject_by_keyword(query: str, api_key: str | None) -> list[str]:
+    """
+    Search the BioProject database by free-text query.
+    Returns a list of BioProject accessions (PRJNA…/PRJEB…/PRJDB…).
+
+    Steps:
+      1. eSearch db=bioproject → UIDs
+      2. esummary on UIDs → resolve to accession strings
+    """
+    sleep = 0.11 if api_key else 0.4
+
+    # ── Step 1: eSearch BioProject ────────────────────────────────────
+    print(f"\n[Step 1] Searching BioProject for: {query!r} ...")
+    params = {
+        "db": "bioproject", "term": query,
+        "usehistory": "y", "retmax": 0, "retmode": "json",
+    }
+    if api_key:
+        params["api_key"] = api_key
+
+    data   = _get(ESEARCH_URL, params).json()["esearchresult"]
+    total  = int(data["count"])
+    webenv = data["webenv"]
+    qkey   = data["querykey"]
+    print(f"  Total BioProject records: {total:,}")
+
+    if total == 0:
+        print(f"  No BioProject records found for query: {query!r}")
+        return []
+
+    uids: list[str] = []
+    for start in tqdm(range(0, total, ESEARCH_BATCH), desc="  Fetching UIDs"):
+        p = {
+            "db": "bioproject", "term": query,
+            "webenv": webenv, "query_key": qkey,
+            "retstart": start, "retmax": ESEARCH_BATCH, "retmode": "json",
+        }
+        if api_key:
+            p["api_key"] = api_key
+        uids.extend(_get(ESEARCH_URL, p).json()["esearchresult"]["idlist"])
+        time.sleep(sleep)
+
+    print(f"  UIDs collected: {len(uids):,}")
+
+    # ── Step 2: esummary → accession strings ─────────────────────────
+    print(f"  Resolving UIDs to BioProject accessions ...")
+    accessions: list[str] = []
+    n_batches = (len(uids) + ESUMMARY_BATCH - 1) // ESUMMARY_BATCH
+
+    for i in tqdm(range(0, len(uids), ESUMMARY_BATCH),
+                  desc="  esummary", total=n_batches):
+        batch = uids[i : i + ESUMMARY_BATCH]
+        params_s: dict = {
+            "db": "bioproject", "id": ",".join(batch), "retmode": "json",
+        }
+        if api_key:
+            params_s["api_key"] = api_key
+        try:
+            result = _get(ESUMMARY_URL, params_s).json().get("result", {})
+            for uid in batch:
+                acc = result.get(uid, {}).get("project_acc", "")
+                if acc:
+                    accessions.append(acc)
+        except Exception as exc:
+            tqdm.write(f"  WARNING: esummary batch at index {i} failed — {exc}")
+        time.sleep(sleep)
+
+    print(f"  BioProject accessions resolved: {len(accessions):,}")
+    return accessions
+
+
 def _fetch_runinfo(uids: list[str], checkpoint_file: str,
                    api_key: str | None, sleep: float) -> pd.DataFrame:
-    """Fetch SRA runinfo in batches, filter to WGS/METAGENOMIC, checkpoint/resume."""
-    rows: list[dict] = []
+    """
+    Fetch SRA runinfo in batches, filter to WGS/METAGENOMIC, checkpoint/resume.
+
+    Rows are written to a temp CSV on disk batch-by-batch instead of
+    accumulating in memory, so large taxons (tens of thousands of UIDs)
+    do not cause out-of-memory crashes.
+    """
+    tmp_csv   = checkpoint_file.replace("_checkpoint.json", "_partial.csv")
     start_idx = 0
 
     if os.path.exists(checkpoint_file):
         with open(checkpoint_file) as fh:
             ckpt = json.load(fh)
-        rows      = ckpt["rows"]
         start_idx = ckpt["next_idx"]
+        # Migrate old checkpoint format: rows were stored inside the JSON
+        if "rows" in ckpt and ckpt["rows"] and not os.path.exists(tmp_csv):
+            pd.DataFrame(ckpt["rows"]).to_csv(tmp_csv, index=False)
+            print(f"\n  Migrated {len(ckpt['rows']):,} rows from old checkpoint format.")
+        rows_so_far = pd.read_csv(tmp_csv).shape[0] if os.path.exists(tmp_csv) else 0
         print(f"\n  Resuming from UID index {start_idx:,} "
-              f"({len(rows):,} runs already collected)")
+              f"({rows_so_far:,} runs already saved)")
 
     print(f"\n[Step 2] Fetching runinfo ({len(uids):,} UIDs, "
           f"batches of {RUNINFO_BATCH}) ...")
@@ -290,11 +442,16 @@ def _fetch_runinfo(uids: list[str], checkpoint_file: str,
 
         try:
             resp     = _get(EFETCH_URL, params)
-            df_batch = pd.read_csv(io.StringIO(resp.text)).dropna(how="all")
+            df_batch = pd.read_csv(
+                io.StringIO(resp.text),
+                engine="python",
+                on_bad_lines="skip",
+            ).dropna(how="all")
             mask     = df_batch["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
             df_batch = df_batch[mask]
             if not df_batch.empty:
-                rows.extend(df_batch.to_dict("records"))
+                header = not os.path.exists(tmp_csv)
+                df_batch.to_csv(tmp_csv, mode="a", header=header, index=False)
         except Exception as exc:
             tqdm.write(f"  WARNING: batch at index {i} failed — {exc}")
 
@@ -302,76 +459,28 @@ def _fetch_runinfo(uids: list[str], checkpoint_file: str,
         pbar.update(len(batch))
 
         with open(checkpoint_file, "w") as fh:
-            json.dump({"rows": rows, "next_idx": i + RUNINFO_BATCH}, fh)
+            json.dump({"next_idx": i + RUNINFO_BATCH}, fh)
 
     pbar.close()
 
-    if os.path.exists(checkpoint_file):
-        os.remove(checkpoint_file)
+    for f in (checkpoint_file, ):
+        if os.path.exists(f):
+            os.remove(f)
 
-    if not rows:
+    if not os.path.exists(tmp_csv):
         sys.exit("No WGS/METAGENOMIC runs found.")
 
-    df = pd.DataFrame(rows).drop_duplicates(subset=["Run"]).reset_index(drop=True)
+    df = (pd.read_csv(tmp_csv)
+            .drop_duplicates(subset=["Run"])
+            .reset_index(drop=True))
+    os.remove(tmp_csv)
+
+    if df.empty:
+        sys.exit("No WGS/METAGENOMIC runs found.")
+
     print(f"  WGS/METAGENOMIC runs: {len(df):,}")
     return df
 
-
-def cmd_fetch_taxon(args: argparse.Namespace) -> None:
-    try:
-        from Bio import Entrez  # noqa: F401 — only needed for api_key plumbing
-    except ImportError:
-        sys.exit("[ERROR] biopython not installed.\n  pip install biopython")
-
-    api_key = args.api_key or None
-    sleep   = 0.11 if api_key else 0.4
-    label   = args.label or f"sra_taxid{args.taxon_id}"
-    out_csv = f"{label}.csv"
-    ckpt    = f"{label}_checkpoint.json"
-
-    print("=" * 60)
-    print(f"  fetch-taxon  —  taxon {args.taxon_id}")
-    print(f"  strategies   :  {', '.join(sorted(TARGET_STRATEGIES))}")
-    print("=" * 60)
-
-    uids    = _search_sra_uids(args.taxon_id, api_key)
-    df_runs = _fetch_runinfo(uids, ckpt, api_key, sleep)
-
-    biosample_accs = (
-        df_runs["BioSample"].dropna().unique().tolist()
-        if "BioSample" in df_runs.columns else []
-    )
-    if biosample_accs:
-        df_bs = fetch_biosample_attributes(biosample_accs)
-        df    = df_runs.merge(df_bs, on="BioSample", how="left")
-    else:
-        print("  WARNING: No BioSample column — skipping attribute fetch.")
-        df = df_runs
-
-    merging = Path(out_csv).exists()
-    print(f"\n[Step 4] {'Merging into' if merging else 'Saving →'} {out_csv} ...")
-    total = save_csv_merge(df, out_csv)
-
-    print(f"\n{'=' * 60}")
-    print(f"  New runs fetched : {len(df):,}")
-    print(f"  Total in file    : {total:,}  ({'merged' if merging else 'created'})  →  {out_csv}")
-    print(f"{'=' * 60}")
-
-    print(f"\nLibraryStrategy:")
-    for val, n in df["LibraryStrategy"].value_counts().items():
-        print(f"  {val:<22} {n:>6}  {'█' * (n * 30 // max(len(df), 1))}")
-
-    print(f"\nPlatform:")
-    for val, n in df["Platform"].value_counts().items():
-        print(f"  {val:<22} {n:>6}")
-
-    total_gb = pd.to_numeric(df["bases"], errors="coerce").sum() / 1e9
-    print(f"\nTotal data: {total_gb:.1f} Gb")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# fetch-project subcommand
-# ══════════════════════════════════════════════════════════════════════════
 
 def _fetch_sra_runinfo(accession: str) -> pd.DataFrame:
     """Fetch SRA runinfo from the SRA Run Selector backend."""
@@ -394,64 +503,337 @@ def _fetch_sra_runinfo(accession: str) -> pd.DataFrame:
 
     content = resp.text.strip()
     if not content or content.startswith("<"):
-        sys.exit(f"  ERROR: No data returned for {accession}. "
-                 "Check the accession is valid and has public data.")
+        print(f"  WARNING: No SRA data returned for {accession} — skipping.")
+        return None
 
     df = pd.read_csv(io.StringIO(content)).dropna(how="all").reset_index(drop=True)
     print(f"  Runs: {len(df):,}")
     return df
 
 
-def cmd_fetch_project(args: argparse.Namespace) -> None:
-    accession = args.accession.strip().upper()
-    out_csv   = args.out or f"{accession}_sra_runs.csv"
-
-    print("=" * 60)
-    print(f"  fetch-project  —  {accession}")
-    print("=" * 60)
-
-    df_runs = _fetch_sra_runinfo(accession)
-
-    biosample_accs = (
-        df_runs["BioSample"].dropna().unique().tolist()
-        if "BioSample" in df_runs.columns else []
-    )
-    if biosample_accs:
-        df_bs = fetch_biosample_attributes(biosample_accs)
-        df    = df_runs.merge(df_bs, on="BioSample", how="left")
-    else:
-        print("  WARNING: No BioSample column — skipping attribute fetch.")
-        df = df_runs
-
-    merging = Path(out_csv).exists()
-    print(f"\n[Step 3] {'Merging into' if merging else 'Saving →'} {out_csv} ...")
-    total = save_csv_merge(df, out_csv)
-
-    print(f"\n{'=' * 60}")
-    print(f"  New runs fetched : {len(df):,}")
-    print(f"  Total in file    : {total:,}  ({'merged' if merging else 'created'})  →  {out_csv}")
-    print(f"{'=' * 60}")
-
-    print(f"\nLibraryStrategy:")
+def _print_summary(df: pd.DataFrame) -> None:
+    """Print LibraryStrategy / Platform / total-data summary for a run DataFrame."""
+    print("\nLibraryStrategy:")
     for val, n in df["LibraryStrategy"].value_counts().items():
-        print(f"  {val:<25} {n:>5}  {'█' * (n * 30 // max(len(df), 1))}")
+        print(f"  {val:<25} {n:>6}  {'█' * (n * 30 // max(len(df), 1))}")
 
-    print(f"\nPlatform:")
+    print("\nPlatform:")
     for val, n in df["Platform"].value_counts().items():
-        print(f"  {val:<25} {n:>5}")
+        print(f"  {val:<25} {n:>6}")
 
     total_gb = pd.to_numeric(df["bases"], errors="coerce").sum() / 1e9
     print(f"\nTotal data: {total_gb:.1f} Gb")
 
-    sra_cols = set(df_runs.columns)
-    bs_cols  = [c for c in df.columns if c not in sra_cols]
-    if bs_cols:
-        print(f"\nBioSample attributes added ({len(bs_cols)}): {', '.join(bs_cols)}")
+
+def _apply_bases_filter(df: pd.DataFrame,
+                        min_bases: int | None,
+                        max_bases: int | None) -> pd.DataFrame:
+    """Filter runs by base count. Returns filtered DataFrame."""
+    if min_bases is None and max_bases is None:
+        return df
+    if "bases" not in df.columns:
+        print("  WARNING: 'bases' column not found — size filter skipped.")
+        return df
+    bases = pd.to_numeric(df["bases"], errors="coerce")
+    mask = pd.Series(True, index=df.index)
+    if min_bases is not None:
+        mask &= bases >= min_bases
+    if max_bases is not None:
+        mask &= bases <= max_bases
+    n_removed = (~mask).sum()
+    if n_removed:
+        lo = f">={min_bases:,}" if min_bases else ""
+        hi = f"<={max_bases:,}" if max_bases else ""
+        bounds = " & ".join(filter(None, [lo, hi]))
+        print(f"  Bases filter ({bounds} bases): removed {n_removed:,} run(s), "
+              f"{mask.sum():,} remaining")
+    return df[mask].reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# fetch-data subcommand
+# ══════════════════════════════════════════════════════════════════════════
+
+def cmd_fetch_data(args: argparse.Namespace) -> None:
+    taxon_ids   = args.taxon      or []
+    bioprojects = load_bioproject_list(args.bioproject or [])
+    sra_accs    = load_bioproject_list(args.accession  or [])
+    keywords    = args.keyword    or []
+
+    if not taxon_ids and not bioprojects and not sra_accs and not keywords:
+        sys.exit("[ERROR] Provide at least one --taxon ID, --bioproject accession, "
+                 "--accession SRA accession, or --keyword query.")
+
+    try:
+        from Bio import Entrez  # noqa: F401 — only needed for api_key plumbing
+    except ImportError:
+        sys.exit("[ERROR] biopython not installed.\n  pip install biopython")
+
+    api_key = args.api_key or None
+    sleep   = 0.11 if api_key else 0.4
+
+    # ── taxon IDs ─────────────────────────────────────────────────────
+    for taxon_id in taxon_ids:
+        out_csv = args.merge_into if args.merge_into else f"sra_taxid{taxon_id}.csv"
+        ckpt    = f"sra_taxid{taxon_id}_checkpoint.json"
+
+        print("=" * 60)
+        print(f"  fetch-data (taxon)  —  taxon {taxon_id}")
+        print(f"  strategies          :  {', '.join(sorted(TARGET_STRATEGIES))}")
+        print("=" * 60)
+
+        uids    = _search_sra_uids(taxon_id, api_key)
+        df_runs = _fetch_runinfo(uids, ckpt, api_key, sleep)
+        df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
+        if df_runs.empty:
+            print(f"  No runs remaining after size filter for taxon {taxon_id} — skipping.")
+            continue
+
+        biosample_accs = (
+            df_runs["BioSample"].dropna().unique().tolist()
+            if "BioSample" in df_runs.columns else []
+        )
+        if biosample_accs:
+            df_bs = fetch_biosample_attributes(biosample_accs)
+            df    = df_runs.merge(df_bs, on="BioSample", how="left")
+        else:
+            print("  WARNING: No BioSample column — skipping attribute fetch.")
+            df = df_runs
+
+        merging = Path(out_csv).exists()
+        print(f"\n[Step 4] {'Merging into' if merging else 'Saving →'} {out_csv} ...")
+        total = save_csv_merge(df, out_csv)
+
+        print(f"\n{'=' * 60}")
+        print(f"  New runs fetched : {len(df):,}")
+        print(f"  Total in file    : {total:,}  ({'merged' if merging else 'created'})  →  {out_csv}")
+        print(f"{'=' * 60}")
+        _print_summary(df)
+
+    # ── BioProject accessions ─────────────────────────────────────────
+    for raw_acc in bioprojects:
+        accession = raw_acc.strip().upper()
+        out_csv = args.merge_into if args.merge_into else f"{accession}_sra_runs.csv"
+
+        print("=" * 60)
+        print(f"  fetch-data (project)  —  {accession}")
+        print("=" * 60)
+
+        df_runs = _fetch_sra_runinfo(accession)
+        if df_runs is None:
+            sys.exit(f"[ERROR] No SRA data for {accession}. "
+                     "Check the accession is valid and has public data.")
+
+        if "LibraryStrategy" in df_runs.columns:
+            n_before = len(df_runs)
+            mask     = df_runs["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
+            df_runs  = df_runs[mask].reset_index(drop=True)
+            print(f"  Strategy filter ({'/'.join(sorted(TARGET_STRATEGIES))}): "
+                  f"{len(df_runs):,} / {n_before:,} runs")
+        if df_runs.empty:
+            print(f"  No WGS/METAGENOMIC runs for {accession} — skipping.")
+            continue
+
+        df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
+        if df_runs.empty:
+            print(f"  No runs remaining after size filter for {accession} — skipping.")
+            continue
+
+        biosample_accs = (
+            df_runs["BioSample"].dropna().unique().tolist()
+            if "BioSample" in df_runs.columns else []
+        )
+        if biosample_accs:
+            df_bs = fetch_biosample_attributes(biosample_accs)
+            df    = df_runs.merge(df_bs, on="BioSample", how="left")
+        else:
+            print("  WARNING: No BioSample column — skipping attribute fetch.")
+            df = df_runs
+
+        merging = Path(out_csv).exists()
+        print(f"\n[Step 3] {'Merging into' if merging else 'Saving →'} {out_csv} ...")
+        total = save_csv_merge(df, out_csv)
+
+        print(f"\n{'=' * 60}")
+        print(f"  New runs fetched : {len(df):,}")
+        print(f"  Total in file    : {total:,}  ({'merged' if merging else 'created'})  →  {out_csv}")
+        print(f"{'=' * 60}")
+        _print_summary(df)
+
+        sra_cols = set(df_runs.columns)
+        bs_cols  = [c for c in df.columns if c not in sra_cols]
+        if bs_cols:
+            print(f"\nBioSample attributes added ({len(bs_cols)}): {', '.join(bs_cols)}")
+
+    # ── SRA accessions (SRR/SRS/SRP/SRX/SAMN/…) ──────────────────────
+    for raw_acc in sra_accs:
+        accession = raw_acc.strip().upper()
+        out_csv = args.merge_into if args.merge_into else f"{accession}_sra_runs.csv"
+
+        print("=" * 60)
+        print(f"  fetch-data (accession)  —  {accession}")
+        print("=" * 60)
+
+        df_runs = _fetch_sra_runinfo(accession)
+        if df_runs is None:
+            print(f"  WARNING: No SRA data returned for {accession} — skipping.")
+            continue
+
+        df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
+        if df_runs.empty:
+            print(f"  No runs remaining after size filter for {accession} — skipping.")
+            continue
+
+        biosample_accs = (
+            df_runs["BioSample"].dropna().unique().tolist()
+            if "BioSample" in df_runs.columns else []
+        )
+        if biosample_accs:
+            df_bs = fetch_biosample_attributes(biosample_accs)
+            df    = df_runs.merge(df_bs, on="BioSample", how="left")
+        else:
+            print("  WARNING: No BioSample column — skipping attribute fetch.")
+            df = df_runs
+
+        merging = Path(out_csv).exists()
+        print(f"\n[Step 3] {'Merging into' if merging else 'Saving →'} {out_csv} ...")
+        total = save_csv_merge(df, out_csv)
+
+        print(f"\n{'=' * 60}")
+        print(f"  New runs fetched : {len(df):,}")
+        print(f"  Total in file    : {total:,}  ({'merged' if merging else 'created'})  →  {out_csv}")
+        print(f"{'=' * 60}")
+        _print_summary(df)
+
+        sra_cols = set(df_runs.columns)
+        bs_cols  = [c for c in df.columns if c not in sra_cols]
+        if bs_cols:
+            print(f"\nBioSample attributes added ({len(bs_cols)}): {', '.join(bs_cols)}")
+
+    # ── keyword queries (BioProject database) ────────────────────────
+    for keyword in keywords:
+        safe    = re.sub(r"[^\w]+", "_", keyword).strip("_").lower()
+        out_csv = args.merge_into if args.merge_into else f"sra_kw_{safe}.csv"
+
+        print("=" * 60)
+        print(f"  fetch-data (keyword)  —  {keyword!r}")
+        print(f"  strategies            :  {', '.join(sorted(TARGET_STRATEGIES))}")
+        print("=" * 60)
+
+        bp_accs = _search_bioproject_by_keyword(keyword, api_key)
+        if not bp_accs:
+            print(f"  Skipping — no BioProject results for {keyword!r}")
+            continue
+
+        print(f"\n[Step 2] Fetching SRA runs for {len(bp_accs):,} BioProjects ...")
+        all_runs: list[pd.DataFrame] = []
+        for acc in tqdm(bp_accs, desc="  BioProject runs", unit="project"):
+            df_bp = _fetch_sra_runinfo(acc)
+            if df_bp is None:
+                continue
+            if "LibraryStrategy" in df_bp.columns:
+                mask  = df_bp["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
+                df_bp = df_bp[mask]
+            if not df_bp.empty:
+                all_runs.append(df_bp)
+
+        if not all_runs:
+            print(f"  No WGS/METAGENOMIC runs found for keyword {keyword!r}")
+            continue
+
+        df_runs = (pd.concat(all_runs, ignore_index=True)
+                     .drop_duplicates(subset=["Run"])
+                     .reset_index(drop=True))
+        print(f"  WGS/METAGENOMIC runs collected: {len(df_runs):,}")
+        df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
+        if df_runs.empty:
+            print(f"  No runs remaining after size filter for keyword {keyword!r} — skipping.")
+            continue
+
+        biosample_accs = (
+            df_runs["BioSample"].dropna().unique().tolist()
+            if "BioSample" in df_runs.columns else []
+        )
+        if biosample_accs:
+            df_bs = fetch_biosample_attributes(biosample_accs)
+            df    = df_runs.merge(df_bs, on="BioSample", how="left")
+        else:
+            print("  WARNING: No BioSample column — skipping attribute fetch.")
+            df = df_runs
+
+        merging = Path(out_csv).exists()
+        print(f"\n[Step 4] {'Merging into' if merging else 'Saving →'} {out_csv} ...")
+        total = save_csv_merge(df, out_csv)
+
+        print(f"\n{'=' * 60}")
+        print(f"  New runs fetched : {len(df):,}")
+        print(f"  Total in file    : {total:,}  ({'merged' if merging else 'created'})  →  {out_csv}")
+        print(f"{'=' * 60}")
+        _print_summary(df)
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # download subcommand
 # ══════════════════════════════════════════════════════════════════════════
+
+def download_group_iseq(
+    srr_list: list[str],
+    bioproject_dir: Path,
+    dry_run: bool,
+    threads: int,
+    parallel: int,
+    database: str,
+    aspera: bool,
+) -> None:
+    """
+    Download SRA runs using iSeq.
+
+    iSeq is called with a temp SRR-list file, writing gzip FASTQ to
+    <bioproject_dir>/ flat. Afterwards each SRR's files are moved into
+    per-SRR subdirectories so the structure matches is_downloaded():
+      <bioproject_dir>/<SRR>/<SRR>*.fastq.gz
+    """
+    bioproject_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp = bioproject_dir / ".iseq_input.tmp"
+    tmp.write_text("\n".join(srr_list) + "\n")
+
+    cmd = [
+        "iseq",
+        "-i", str(tmp),
+        "-o", str(bioproject_dir),
+        "-g",
+        "-t", str(threads),
+        "-p", str(parallel),
+        "-d", database,
+    ]
+    if aspera:
+        cmd.append("-a")
+
+    if dry_run:
+        print(f"    [DRY RUN] {' '.join(cmd)}")
+        tmp.unlink(missing_ok=True)
+        return
+
+    result = subprocess.run(cmd, text=True)
+    tmp.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        print(f"  [WARNING] iSeq exited with errors for {bioproject_dir.name}")
+
+    # Reorganise flat files into per-SRR subdirectories
+    for srr in srr_list:
+        matched = (
+            list(bioproject_dir.glob(f"{srr}*.fastq.gz")) +
+            list(bioproject_dir.glob(f"{srr}*.fastq"))
+        )
+        if not matched:
+            continue
+        srr_dir = bioproject_dir / srr
+        srr_dir.mkdir(exist_ok=True)
+        for f in matched:
+            f.rename(srr_dir / f.name)
+
 
 def download_group(
     srr_list: list[str],
@@ -572,7 +954,7 @@ def _gzip_fastq(directory: Path) -> None:
 
 def cmd_download(args: argparse.Namespace) -> None:
     if not args.dry_run:
-        check_tools(no_prefetch=args.no_prefetch)
+        check_tools(no_prefetch=args.no_prefetch, iseq=args.iseq)
 
     outdir = Path(args.outdir).resolve()
 
@@ -583,17 +965,32 @@ def cmd_download(args: argparse.Namespace) -> None:
     groups = acc_df.groupby("BioProject")["Run"].apply(list)
     print(f"  BioProjects : {len(groups):,}")
 
-    mode = "DRY RUN" if args.dry_run else ("fasterq-dump direct" if args.no_prefetch else "prefetch + fasterq-dump")
+    if args.dry_run:
+        mode = "DRY RUN"
+    elif args.iseq:
+        mode = f"iSeq  (db={args.database}, parallel={args.parallel})"
+    elif args.no_prefetch:
+        mode = "fasterq-dump direct"
+    else:
+        mode = "prefetch + fasterq-dump"
     print(f"\n[Step 2] Downloading ({mode}) ...")
 
     for bp, srrs in tqdm(groups.items(), desc="  BioProject", unit="project"):
         bp_dir = outdir / bp
         tqdm.write(f"  {bp}  ({len(srrs)} runs)  →  {bp_dir}")
-        download_group(srrs, bp_dir,
-                       dry_run=args.dry_run,
-                       threads=args.threads,
-                       prefetch_max_gb=args.max_size,
-                       no_prefetch=args.no_prefetch)
+        if args.iseq:
+            download_group_iseq(srrs, bp_dir,
+                                dry_run=args.dry_run,
+                                threads=args.threads,
+                                parallel=args.parallel,
+                                database=args.database,
+                                aspera=args.aspera)
+        else:
+            download_group(srrs, bp_dir,
+                           dry_run=args.dry_run,
+                           threads=args.threads,
+                           prefetch_max_gb=args.max_size,
+                           no_prefetch=args.no_prefetch)
 
     if args.dry_run:
         print("\n[DRY RUN] Done. No files downloaded.")
@@ -603,7 +1000,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     print(f"  Download complete")
     print(f"  Runs   : {len(acc_df):,}")
     print(f"  Outdir : {outdir}")
-    print(f"  Next   : python MGX_data.py parse --reference <ref.csv> --outdir {outdir}")
+    print(f"  Next   : python MGX_data.py parse --source-data <ref.csv> --location {outdir}")
     print(f"{'=' * 55}")
 
 
@@ -644,29 +1041,58 @@ def update_reference(df_ref: pd.DataFrame, df_confirmed: pd.DataFrame,
 
     df_ref = reorder_zlab_first(df_ref)
     df_ref.to_csv(reference_path, index=False)
-    print(f"  Reference CSV updated in-place → {reference_path}")
+    print(f"  Source data CSV updated in-place → {reference_path}")
     print(f"  {mask.sum()} runs marked as downloaded")
 
 
 def cmd_parse(args: argparse.Namespace) -> None:
-    outdir = Path(args.outdir).resolve()
+    location = Path(args.location).resolve()
 
-    print("\n[Step 1] Loading reference ...")
-    df_ref = pd.read_csv(args.reference, dtype=str)
-    print(f"  Reference rows : {len(df_ref):,}")
+    print("\n[Step 1] Loading source data ...")
+    df_ref = pd.read_csv(args.source_data, dtype=str)
+    print(f"  Source data rows : {len(df_ref):,}")
 
     if "Run" not in df_ref.columns:
-        sys.exit("[ERROR] Reference CSV has no 'Run' column.")
+        sys.exit("[ERROR] Source data CSV has no 'Run' column.")
     if "BioProject" not in df_ref.columns:
-        sys.exit("[ERROR] Reference CSV has no 'BioProject' column.")
+        sys.exit("[ERROR] Source data CSV has no 'BioProject' column.")
 
     ref_runs = set(df_ref["Run"])
+
+    print("\n[Step 2] Scanning disk for unknown SRRs ...")
+    disk_srrs = scan_downloaded_srrs(location)
+    unknown = {srr: bp for srr, bp in disk_srrs.items() if srr not in ref_runs}
+    if unknown:
+        print(f"  Found {len(unknown):,} downloaded SRR(s) not in source data — back-fetching metadata ...")
+        unknown_by_bp: dict[str, list[str]] = {}
+        for srr, bp in unknown.items():
+            unknown_by_bp.setdefault(bp, []).append(srr)
+        fetched_dfs = []
+        for bp, srrs in unknown_by_bp.items():
+            print(f"  Fetching runinfo for {bp} ({len(srrs)} unknown run(s)) ...")
+            df_bp = _fetch_sra_runinfo(bp)
+            if df_bp is None:
+                continue
+            df_bp = df_bp[df_bp["Run"].isin(srrs)]
+            if not df_bp.empty:
+                fetched_dfs.append(df_bp)
+        if fetched_dfs:
+            df_fetched = pd.concat(fetched_dfs, ignore_index=True)
+            total = save_csv_merge(df_fetched, args.source_data)
+            print(f"  Source data updated → {args.source_data}  ({total:,} total rows)")
+            df_ref = pd.read_csv(args.source_data, dtype=str)
+            ref_runs = set(df_ref["Run"])
+            print(f"  Source data rows (after update) : {len(df_ref):,}")
+        else:
+            print("  No metadata retrieved for unknown SRRs.")
+    else:
+        print(f"  No unknown SRRs found.")
 
     if args.accessions:
         srr_list = load_accessions_any(args.accessions)
         missing  = [s for s in srr_list if s not in ref_runs]
         if missing:
-            print(f"  [WARNING] {len(missing)} accessions not found in reference:")
+            print(f"  [WARNING] {len(missing)} accessions not found in source data:")
             for s in missing[:10]:
                 print(f"    {s}")
             if len(missing) > 10:
@@ -675,12 +1101,12 @@ def cmd_parse(args: argparse.Namespace) -> None:
         print(f"  Accessions     : {len(srr_list):,}")
     else:
         srr_list = list(ref_runs)
-        print(f"  Scanning all {len(srr_list):,} reference SRRs")
+        print(f"  Processing all {len(srr_list):,} source data SRRs")
 
     if not srr_list:
         sys.exit("[ERROR] No valid accessions to process.")
 
-    print("\n[Step 2] Scanning disk for FASTQ files ...")
+    print("\n[Step 3] Scanning disk for FASTQ files ...")
     df_targets       = df_ref[df_ref["Run"].isin(srr_list)][["Run", "BioProject"]].copy()
     confirmed, not_found = [], []
 
@@ -689,7 +1115,7 @@ def cmd_parse(args: argparse.Namespace) -> None:
         if rows.empty:
             not_found.append(srr)
             continue
-        if is_downloaded(srr, outdir / rows.iloc[0]):
+        if is_downloaded(srr, location / rows.iloc[0]):
             confirmed.append(srr)
         else:
             not_found.append(srr)
@@ -700,29 +1126,29 @@ def cmd_parse(args: argparse.Namespace) -> None:
     if not confirmed:
         sys.exit("[ERROR] No FASTQ files found on disk. Run 'download' first.")
 
-    print(f"\n[Step 3] Building metadata for {len(confirmed):,} confirmed runs ...")
+    print(f"\n[Step 4] Building metadata for {len(confirmed):,} confirmed runs ...")
     df_confirmed = df_ref[df_ref["Run"].isin(confirmed)].copy()
     df_confirmed = drop_blank_columns(df_confirmed)
 
     df_confirmed["Zlab_sort"]          = "1"
     df_confirmed["Zlab_SRA_path"]      = df_confirmed.apply(
-        lambda row: str(outdir / row["BioProject"] / row["Run"]), axis=1
+        lambda row: str(location / row["BioProject"] / row["Run"]), axis=1
     )
     df_confirmed["Zlab_metadata_path"] = ""
     df_confirmed = reorder_zlab_first(df_confirmed)
     print(f"  Columns in parsed output : {len(df_confirmed.columns)}")
 
-    print("\n[Step 4] Updating parsed file ...")
+    print("\n[Step 5] Updating parsed file ...")
     update_parsed_file(df_confirmed, args.parsed)
 
-    print("\n[Step 5] Updating reference CSV ...")
-    df_ref_fresh = pd.read_csv(args.reference, dtype=str)
-    update_reference(df_ref_fresh, df_confirmed, args.reference)
+    print("\n[Step 6] Updating source data CSV ...")
+    df_ref_fresh = pd.read_csv(args.source_data, dtype=str)
+    update_reference(df_ref_fresh, df_confirmed, args.source_data)
 
     print(f"\n{'=' * 55}")
     print(f"  Confirmed   : {len(confirmed):,} / {len(srr_list):,} runs on disk")
     print(f"  Parsed file : {args.parsed}")
-    print(f"  Reference   : {args.reference}  (updated in-place)")
+    print(f"  Source data : {args.source_data}  (updated in-place)")
     print(f"{'=' * 55}")
 
 
@@ -738,41 +1164,43 @@ def main():
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     sub.required = True
 
-    # ── fetch-taxon ───────────────────────────────────────────────────
-    ft = sub.add_parser(
-        "fetch-taxon",
-        help="Fetch all WGS/METAGENOMIC SRA runs for a taxon ID",
+    # ── fetch-data ────────────────────────────────────────────────────
+    fd = sub.add_parser(
+        "fetch-data",
+        help="Fetch SRA run and biosample metadata",
         description=(
-            "Search SRA by NCBI Taxon ID and fetch all WGS/METAGENOMIC run metadata,\n"
-            "merged with BioSample attributes. Supports checkpoint/resume."
+            "Examples:\n"
+            "  python MGX_data.py fetch-data --taxon 1510822 --email you@email.com\n"
+            "  python MGX_data.py fetch-data --bioproject bioproject_list.txt\n"
+            "  python MGX_data.py fetch-data --accession acc_list.txt\n"
+            "  python MGX_data.py fetch-data --keyword \"pig gut metagenome\" "
+            "--merge-into sra_taxid1510822.csv"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ft.add_argument("--taxon-id", required=True,
-                    help="NCBI Taxon ID (e.g. 1510822 for pig gut metagenome)")
-    ft.add_argument("--email",    required=True,
-                    help="Your email — required by NCBI policy")
-    ft.add_argument("--api-key",  default=None,
+    fd.add_argument("--taxon",      nargs="+", default=[], metavar="ID",
+                    help="NCBI Taxon ID(s) — one or more (e.g. 1510822 9606)")
+    fd.add_argument("--bioproject", nargs="+", default=[], metavar="ACC/FILE",
+                    help="BioProject/SRA Study accession(s), or a path to a plain-text "
+                         "file with one accession per line (e.g. PRJNA857725)")
+    fd.add_argument("--accession",  nargs="+", default=[], metavar="ACC/FILE",
+                    help="SRA accession(s) — any type accepted: SRR, SRS, SRP, SRX, "
+                         "SAMN, ERR, ERS, DRR, etc. Or a path to a plain-text file "
+                         "with one accession per line.")
+    fd.add_argument("--keyword",     nargs="+", default=[], metavar="QUERY",
+                    help="Free-text keyword query/queries. Supports NCBI query syntax, "
+                         "e.g. --keyword \"pig gut metagenome\" ")
+    fd.add_argument("--merge-into", default=None, metavar="CSV",
+                    help="Output CSV file for all results. If the file already exists, "
+                         "new runs are appended and deduplicated on Run ID. ")
+    fd.add_argument("--min-bases", type=int, default=None, metavar="N",
+                    help="Exclude runs with fewer than N bases (e.g. 1000000000 for 1 Gb)")
+    fd.add_argument("--max-bases", type=int, default=None, metavar="N",
+                    help="Exclude runs with more than N bases (e.g. 50000000000 for 50 Gb)")
+    fd.add_argument("--email",      default=None,
+                    help="Your email — recommended by NCBI policy")
+    fd.add_argument("--api-key",    default=None,
                     help="NCBI API key — raises rate limit 3 → 10 req/s")
-    ft.add_argument("--label",    default=None,
-                    help="Output filename prefix (default: sra_taxid<ID>)")
-
-    # ── fetch-project ─────────────────────────────────────────────────
-    fp = sub.add_parser(
-        "fetch-project",
-        help="Fetch full SRA run metadata for one BioProject or SRA Study",
-        description=(
-            "Fetch SRA Run Selector-style metadata for a single BioProject\n"
-            "or SRA Study accession, including all BioSample attributes."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    fp.add_argument("--accession", required=True,
-                    help="BioProject (PRJNA…) or SRA Study (SRP…) accession")
-    fp.add_argument("--email",     default=None,
-                    help="Your email (recommended for NCBI requests)")
-    fp.add_argument("--out",       default=None,
-                    help="Output CSV filename (default: <accession>_sra_runs.csv)")
 
     # ── download ──────────────────────────────────────────────────────
     dl = sub.add_parser(
@@ -788,18 +1216,39 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     dl.add_argument("--accessions", required=True,
-                    help="Two-column CSV/TSV: Run, BioProject (header optional)")
+                    help="Plain-text two-column file, no header. "
+                         "Column 1: SRA run accession. Column 2: BioProject. ")
     dl.add_argument("--outdir",     required=True,
                     help="Download root directory")
     dl.add_argument("--threads",    type=int, default=FASTERQ_THREADS,
-                    help=f"fasterq-dump threads (default: {FASTERQ_THREADS})")
-    dl.add_argument("--max-size",   type=int, default=PREFETCH_MAX_GB,
-                    help=f"Max SRA file size in GB for prefetch (default: {PREFETCH_MAX_GB})")
+                    help=f"Threads for conversion/compression (default: {FASTERQ_THREADS})")
     dl.add_argument("--dry-run",    action="store_true",
                     help="Print commands without executing")
+
+    # ── iSeq mode ─────────────────────────────────────────────────────
+    dl.add_argument("--iseq",       action="store_true",
+                    help="Use iSeq for downloading instead of SRA Toolkit. "
+                         "Recommended: faster, supports ENA mirror, resumable. "
+                         "Requires: conda install bioconda::iseq")
+    dl.add_argument("--parallel",   type=int, default=8, metavar="N",
+                    help="iSeq: parallel download connections (default: 8). "
+                         "Only used with --iseq.")
+    dl.add_argument("--database",   default="ena", choices=["ena", "sra"],
+                    help="iSeq: download source database (default: ena). "
+                         "ena is generally faster outside the US. "
+                         "Only used with --iseq.")
+    dl.add_argument("--aspera",     action="store_true",
+                    help="iSeq: use Aspera for faster transfers. "
+                         "Only used with --iseq.")
+
+    # ── SRA Toolkit mode ──────────────────────────────────────────────
+    dl.add_argument("--max-size",   type=int, default=PREFETCH_MAX_GB,
+                    help=f"Max SRA file size in GB for prefetch (default: {PREFETCH_MAX_GB}). "
+                         "Only used without --iseq.")
     dl.add_argument("--no-prefetch", action="store_true",
                     help="Skip prefetch; call fasterq-dump directly on each SRR accession. "
-                         "Use this if prefetch fails with SSL/TLS errors (common in mainland China)")
+                         "Use this if prefetch fails with SSL/TLS errors. "
+                         "Only used without --iseq.")
 
     # ── parse ─────────────────────────────────────────────────────────
     pa = sub.add_parser(
@@ -807,7 +1256,7 @@ def main():
         help="Scan downloaded FASTQ files and update metadata CSVs",
         description=(
             "Scan downloaded FASTQ files on disk, build curated metadata,\n"
-            "and update parsed CSV + reference CSV in-place.\n\n"
+            "and update parsed CSV + source data CSV in-place.\n\n"
             "Zlab columns added (first 3 columns of both output CSVs):\n"
             "  Zlab_sort           manual sort order (default '1')\n"
             "  Zlab_SRA_path       absolute path to BioProject FASTQ directory\n"
@@ -815,25 +1264,26 @@ def main():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    pa.add_argument("--reference",  required=True,
-                    help="Reference metadata CSV from fetch-taxon or fetch-project")
-    pa.add_argument("--outdir",     required=True,
-                    help="Root directory containing BioProject subdirectories")
+    pa.add_argument("--source-data", required=True, dest="source_data",
+                    help="Source metadata CSV from fetch-data. "
+                         "Updated in-place with Zlab columns and any back-fetched runs.")
+    pa.add_argument("--location",   required=True,
+                    help="Root directory containing BioProject subdirectories "
+                         "(e.g. <location>/<BioProject>/<SRR>/)")
     pa.add_argument("--parsed",     default="parsed_metadata.csv",
                     help="Curated output CSV, appended across batches "
                          "(default: parsed_metadata.csv)")
     pa.add_argument("--accessions",
                     help="Optional: limit scan to these SRRs. Accepts single-column "
                          "SRR list or two-column Run,BioProject file. "
-                         "Omit to scan all SRRs in the reference.")
+                         "Omit to scan all SRRs in the source data.")
 
     args = parser.parse_args()
 
     dispatch = {
-        "fetch-taxon":   cmd_fetch_taxon,
-        "fetch-project": cmd_fetch_project,
-        "download":      cmd_download,
-        "parse":         cmd_parse,
+        "fetch-data": cmd_fetch_data,
+        "download":   cmd_download,
+        "parse":      cmd_parse,
     }
     dispatch[args.command](args)
 
