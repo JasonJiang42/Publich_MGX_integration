@@ -24,6 +24,49 @@ The current `MGX_data.py` is updated from the former `MGX_data copy.py` version.
 
 ---
 
+## Repository layout
+
+```text
+.
+├── MGX_data.py                 # Main command-line pipeline
+├── README.md                   # Project overview and workflow
+├── requirements.txt            # Python package dependencies
+├── environment.yml             # Conda environment, including SRA Toolkit
+├── pyproject.toml              # Installable Python project metadata
+├── examples/
+│   └── accession_example.txt   # Example two-column run/BioProject file
+├── docs/
+│   └── USAGE.md                # Additional usage notes
+├── tests/
+│   └── test_cli.py             # CLI smoke tests
+└── .github/workflows/ci.yml    # GitHub Actions CI
+```
+
+## Installation
+
+### Pip / virtualenv
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+Then run either:
+
+```bash
+python MGX_data.py <command> -h
+mgx-data <command> -h
+```
+
+### Conda
+
+```bash
+conda env create -f environment.yml
+conda activate mgx-data
+```
+
 ## Requirements
 
 Python packages:
@@ -147,7 +190,7 @@ python MGX_data.py fetch-data \
 
 ### Step 2 — Download
 
-Prepare a two-column accessions file with **no header**:
+Prepare a two-column accessions file with **no header**. See `examples/accession_example.txt` for an example:
 
 ```text
 SRR21388550,PRJNA857725

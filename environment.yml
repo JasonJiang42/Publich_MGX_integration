@@ -1,0 +1,13 @@
+name: mgx-data
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10
+  - pandas
+  - requests
+  - tqdm
+  - biopython
+  - sra-tools
+  # Optional faster downloader:
+  # - iseq

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "publich-mgx-integration"
+version = "0.1.0"
+description = "CLI pipeline for fetching, downloading, and parsing SRA metagenomics data."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "biopython",
+  "pandas",
+  "requests",
+  "tqdm",
+]
+keywords = ["SRA", "metagenomics", "bioinformatics", "NCBI", "FASTQ"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.scripts]
+mgx-data = "MGX_data:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+]
+
+[tool.setuptools]
+py-modules = ["MGX_data"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

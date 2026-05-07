@@ -13,7 +13,7 @@ Usage:
     python MGX_data.py fetch-data --bioproject PRJNA857725 PRJNA123456
     python MGX_data.py fetch-data --taxon 1510822 --bioproject PRJNA857725 --email you@email.com
     python MGX_data.py download   --accessions runs.csv --outdir ./fastq
-    python MGX_data.py parse      --reference sra_taxid1510822.csv --outdir ./fastq
+    python MGX_data.py parse      --source-data source_data.csv --location ./fastq
 
 Run with -h for full argument list:
     python MGX_data.py <command> -h
