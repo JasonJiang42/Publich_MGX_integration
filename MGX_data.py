@@ -679,6 +679,16 @@ def cmd_fetch_data(args: argparse.Namespace) -> None:
             print(f"  WARNING: No SRA data returned for {accession} — skipping.")
             continue
 
+        if "LibraryStrategy" in df_runs.columns:
+            n_before = len(df_runs)
+            mask     = df_runs["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
+            df_runs  = df_runs[mask].reset_index(drop=True)
+            print(f"  Strategy filter ({'/'.join(sorted(TARGET_STRATEGIES))}): "
+                  f"{len(df_runs):,} / {n_before:,} runs")
+        if df_runs.empty:
+            print(f"  No WGS/METAGENOMIC runs for {accession} — skipping.")
+            continue
+
         df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
         if df_runs.empty:
             print(f"  No runs remaining after size filter for {accession} — skipping.")
