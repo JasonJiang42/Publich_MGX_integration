@@ -6,7 +6,7 @@ A single-script pipeline for fetching, downloading, and organising SRA metagenom
 
 ## Latest updates
 
-The current `MGX_data.py` is updated from the former `MGX_data copy.py` version. Major changes:
+The current `MGX_data.py` is updated from the former `MGX_data.py` version. Major changes:
 
 - Replaced the old `fetch-taxon` and `fetch-project` commands with one unified `fetch-data` command.
 - `fetch-data` can now collect metadata by:
