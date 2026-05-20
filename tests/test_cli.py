@@ -2,6 +2,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from MGX_data import parse_strategy_values
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "MGX_data.py"
@@ -31,3 +33,16 @@ def test_subcommand_help():
         result = run_cli(command, "-h")
         assert result.returncode == 0
         assert "usage:" in result.stdout
+
+
+def test_fetch_data_strategy_help():
+    result = run_cli("fetch-data", "-h")
+    assert result.returncode == 0
+    assert "--strategy" in result.stdout
+    assert "AMPLICON" in result.stdout
+
+
+def test_parse_strategy_values():
+    assert parse_strategy_values(["16S"]) == {"AMPLICON"}
+    assert parse_strategy_values(["WGS,AMPLICON"]) == {"WGS", "AMPLICON"}
+    assert parse_strategy_values(["all"]) is None

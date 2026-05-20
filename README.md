@@ -6,6 +6,15 @@ A single-script pipeline for fetching, downloading, and organising SRA metagenom
 
 ## Latest updates
 
+### 2026-05-20
+
+- Refactored `fetch-data` to stream SRA runinfo batches to temporary CSV files, reducing memory use for large taxon, BioProject, accession, and keyword searches.
+- Added checkpoint/resume support for streamed runinfo fetches, including migration support for older taxon checkpoint files.
+- Added configurable `--strategy` filtering for SRA `LibraryStrategy` values, with aliases such as `16S` -> `AMPLICON` and `--strategy all` to disable filtering.
+- Updated README examples and CLI tests for the new strategy filtering behavior.
+
+### Earlier updates
+
 The current `MGX_data.py` is updated from the former `MGX_data.py` version. Major changes:
 
 - Replaced the old `fetch-taxon` and `fetch-project` commands with one unified `fetch-data` command.
@@ -116,6 +125,22 @@ python MGX_data.py fetch-data \
     --api-key YOUR_NCBI_KEY
 ```
 
+By default, `fetch-data` keeps `WGS` and `METAGENOMIC` SRA `LibraryStrategy` runs. To fetch 16S/marker-gene amplicon data, provide a strategy:
+
+```bash
+python MGX_data.py fetch-data \
+    --taxon 1510822 \
+    --strategy AMPLICON \
+    --email you@email.com
+```
+
+You can combine strategies or disable strategy filtering:
+
+```bash
+python MGX_data.py fetch-data --taxon 1510822 --strategy WGS AMPLICON
+python MGX_data.py fetch-data --taxon 1510822 --strategy all
+```
+
 Default output:
 
 ```text
@@ -162,7 +187,7 @@ python MGX_data.py fetch-data \
     --email you@email.com
 ```
 
-This searches NCBI BioProject by keyword, resolves BioProject accessions, and fetches matching WGS/METAGENOMIC SRA runs.
+This searches NCBI BioProject by keyword, resolves BioProject accessions, and fetches matching SRA runs using the selected `--strategy` filter.
 
 #### Merge multiple searches into one CSV
 
