@@ -12,6 +12,7 @@ Usage:
     python MGX_data.py fetch-data --taxon 1510822 --email you@email.com
     python MGX_data.py fetch-data --bioproject PRJNA857725 PRJNA123456
     python MGX_data.py fetch-data --taxon 1510822 --bioproject PRJNA857725 --email you@email.com
+    python MGX_data.py fetch-data --taxon 1510822 --strategy AMPLICON --email you@email.com
     python MGX_data.py download   --accessions runs.csv --outdir ./fastq
     python MGX_data.py parse      --source-data source_data.csv --location ./fastq
 
@@ -27,6 +28,7 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import os
@@ -57,7 +59,21 @@ ESUMMARY_URL     = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 BIOSAMPLE_URL    = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 SRA_RUNS_URL     = "https://trace.ncbi.nlm.nih.gov/Traces/sra-db-be/runs"
 
-TARGET_STRATEGIES = {"WGS", "METAGENOMIC"}
+DEFAULT_TARGET_STRATEGIES = {"WGS", "METAGENOMIC"}
+STRATEGY_ALIASES = {
+    # Convenience aliases for common user terminology.
+    # SRA normally stores 16S/marker-gene runs as LibraryStrategy=AMPLICON.
+    "16S": "AMPLICON",
+    "16S_RRNA": "AMPLICON",
+    "16S-RRNA": "AMPLICON",
+    "16S RRNA": "AMPLICON",
+    "AMPLICON_SEQUENCING": "AMPLICON",
+    "METAGENOME": "METAGENOMIC",
+    "METAGENOMICS": "METAGENOMIC",
+    "WHOLE_GENOME_SHOTGUN": "WGS",
+    "WHOLE-GENOME-SHOTGUN": "WGS",
+}
+ALL_STRATEGY_TOKENS = {"ALL", "ANY", "*", "NONE"}
 
 ZLAB_COLS = [
     "Zlab_sort",
@@ -260,6 +276,83 @@ def drop_blank_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[[c for c in df.columns if not all_blank(c)]]
 
 
+def parse_strategy_values(values: list[str] | None) -> set[str] | None:
+    """
+    Parse fetch-data --strategy values.
+
+    Returns:
+      * set of upper-case SRA LibraryStrategy values to keep; or
+      * None when the user selected all/any strategies (no filtering).
+
+    Comma-separated values are accepted in addition to space-separated values:
+      --strategy WGS METAGENOMIC
+      --strategy AMPLICON
+      --strategy WGS,AMPLICON
+      --strategy all
+    """
+    if not values:
+        return set(DEFAULT_TARGET_STRATEGIES)
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part.strip() for part in str(value).split(","))
+    tokens = [tok for tok in tokens if tok]
+
+    if not tokens:
+        sys.exit("[ERROR] --strategy was provided but no strategy names were found.")
+
+    normalized: set[str] = set()
+    for token in tokens:
+        key = token.strip().upper()
+        if key in ALL_STRATEGY_TOKENS:
+            return None
+        normalized.add(STRATEGY_ALIASES.get(key, key))
+
+    return normalized
+
+
+def strategy_label(strategies: set[str] | None, sep: str = "/") -> str:
+    """Human-readable label for selected LibraryStrategy values."""
+    if strategies is None:
+        return "ALL (no LibraryStrategy filter)"
+    return sep.join(sorted(strategies))
+
+
+def strategy_slug(strategies: set[str] | None) -> str:
+    """Filesystem-safe suffix for strategy-specific checkpoint files."""
+    if strategies == DEFAULT_TARGET_STRATEGIES:
+        return ""
+    if strategies is None:
+        return "_strategy_all"
+    text = "_".join(sorted(strategies)).lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return f"_strategy_{text}" if text else ""
+
+
+def filter_by_strategy(df: pd.DataFrame,
+                       strategies: set[str] | None,
+                       context: str = "runs",
+                       verbose: bool = True) -> pd.DataFrame:
+    """Filter a runinfo DataFrame by LibraryStrategy and print a short summary."""
+    if strategies is None:
+        if verbose:
+            print(f"  Strategy filter: disabled ({len(df):,} {context})")
+        return df.reset_index(drop=True)
+
+    if "LibraryStrategy" not in df.columns:
+        if verbose:
+            print("  WARNING: 'LibraryStrategy' column not found — strategy filter skipped.")
+        return df.reset_index(drop=True)
+
+    n_before = len(df)
+    mask = df["LibraryStrategy"].fillna("").astype(str).str.upper().isin(strategies)
+    df_filtered = df[mask].reset_index(drop=True)
+    if verbose:
+        print(f"  Strategy filter ({strategy_label(strategies)}): "
+              f"{len(df_filtered):,} / {n_before:,} {context}")
+    return df_filtered
+
+
 def reorder_zlab_first(df: pd.DataFrame) -> pd.DataFrame:
     """Place Zlab columns first, then Run, then everything else."""
     present_zlab = [c for c in ZLAB_COLS if c in df.columns]
@@ -401,38 +494,141 @@ def _search_bioproject_by_keyword(query: str, api_key: str | None) -> list[str]:
     return accessions
 
 
-def _fetch_runinfo(uids: list[str], checkpoint_file: str,
-                   api_key: str | None, sleep: float) -> pd.DataFrame:
+def _csv_data_rows(path: str) -> int:
+    """Count data rows in a CSV without loading it into a DataFrame."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            return max(sum(1 for _ in fh) - 1, 0)
+    except OSError:
+        return 0
+
+
+def _stream_runinfo_to_disk(
+    items: list[str],
+    tmp_csv: str,
+    checkpoint_file: str,
+    fetch_fn,
+    sleep: float,
+    desc: str = "  fetching",
+    unit: str = "item",
+    batch_size: int = 1,
+    filter_strategy: bool = True,
+    target_strategies: set[str] | None = None,
+) -> pd.DataFrame:
     """
-    Fetch SRA runinfo in batches, filter to WGS/METAGENOMIC, checkpoint/resume.
+    Generic streaming-to-disk fetcher with checkpoint/resume.
+
+    Each fetched DataFrame is filtered, appended to ``tmp_csv``, and then
+    discarded.  ``checkpoint_file`` stores the next item index after each
+    completed batch so a crashed run can resume without refetching all prior
+    items.  At normal completion the temp CSV is read once, deduplicated on
+    ``Run`` when present, and both temp files are removed.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+
+    total_items = len(items)
+    start_idx = 0
+
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file) as fh:
+            ckpt = json.load(fh)
+        start_idx = min(int(ckpt.get("next_idx", 0)), total_items)
+
+        # Migrate the old taxon checkpoint format, which stored rows in JSON.
+        if "rows" in ckpt and ckpt["rows"] and not os.path.exists(tmp_csv):
+            pd.DataFrame(ckpt["rows"]).to_csv(tmp_csv, index=False)
+            print(f"\n  Migrated {len(ckpt['rows']):,} rows from old checkpoint format.")
+
+        if start_idx and not os.path.exists(tmp_csv):
+            print("\n  WARNING: checkpoint exists but partial CSV is missing; "
+                  "restarting this fetch from the beginning.")
+            start_idx = 0
+
+        rows_so_far = _csv_data_rows(tmp_csv)
+        print(f"\n  Resuming from {unit} index {start_idx:,} "
+              f"({rows_so_far:,} runs already saved)")
+
+    pbar = tqdm(total=total_items, initial=start_idx, desc=desc, unit=unit)
+    strategy_warned = False
+
+    try:
+        for i in range(start_idx, total_items, batch_size):
+            batch = items[i : i + batch_size]
+            fetch_arg = batch if batch_size > 1 else batch[0]
+
+            try:
+                df_batch = fetch_fn(fetch_arg)
+                if df_batch is not None:
+                    df_batch = df_batch.dropna(how="all")
+                    if filter_strategy and target_strategies is not None:
+                        if "LibraryStrategy" in df_batch.columns:
+                            mask = (df_batch["LibraryStrategy"]
+                                    .fillna("")
+                                    .astype(str)
+                                    .str.upper()
+                                    .isin(target_strategies))
+                            df_batch = df_batch[mask]
+                        elif not strategy_warned:
+                            tqdm.write("  WARNING: 'LibraryStrategy' column not found — "
+                                       "strategy filter skipped for streamed batches.")
+                            strategy_warned = True
+
+                    if not df_batch.empty:
+                        header = not os.path.exists(tmp_csv)
+                        df_batch.to_csv(tmp_csv, mode="a", header=header, index=False)
+                del df_batch
+            except Exception:
+                # Leave the checkpoint at the current item so resume retries it.
+                with open(checkpoint_file, "w") as fh:
+                    json.dump({"next_idx": i}, fh)
+                raise
+            finally:
+                gc.collect()
+
+            next_idx = min(i + len(batch), total_items)
+            with open(checkpoint_file, "w") as fh:
+                json.dump({"next_idx": next_idx}, fh)
+
+            time.sleep(sleep)
+            pbar.update(len(batch))
+    finally:
+        pbar.close()
+
+    if not os.path.exists(tmp_csv) or _csv_data_rows(tmp_csv) == 0:
+        for f in (checkpoint_file, tmp_csv):
+            if os.path.exists(f):
+                os.remove(f)
+        return pd.DataFrame()
+
+    df = pd.read_csv(tmp_csv).dropna(how="all")
+    if "Run" in df.columns:
+        df = df.drop_duplicates(subset=["Run"])
+    df = df.reset_index(drop=True)
+
+    for f in (checkpoint_file, tmp_csv):
+        if os.path.exists(f):
+            os.remove(f)
+
+    return df
+
+
+def _fetch_runinfo(uids: list[str], checkpoint_file: str,
+                   api_key: str | None, sleep: float,
+                   target_strategies: set[str] | None) -> pd.DataFrame:
+    """
+    Fetch SRA runinfo in batches, filter by LibraryStrategy, checkpoint/resume.
 
     Rows are written to a temp CSV on disk batch-by-batch instead of
     accumulating in memory, so large taxons (tens of thousands of UIDs)
     do not cause out-of-memory crashes.
     """
     tmp_csv   = checkpoint_file.replace("_checkpoint.json", "_partial.csv")
-    start_idx = 0
-
-    if os.path.exists(checkpoint_file):
-        with open(checkpoint_file) as fh:
-            ckpt = json.load(fh)
-        start_idx = ckpt["next_idx"]
-        # Migrate old checkpoint format: rows were stored inside the JSON
-        if "rows" in ckpt and ckpt["rows"] and not os.path.exists(tmp_csv):
-            pd.DataFrame(ckpt["rows"]).to_csv(tmp_csv, index=False)
-            print(f"\n  Migrated {len(ckpt['rows']):,} rows from old checkpoint format.")
-        rows_so_far = pd.read_csv(tmp_csv).shape[0] if os.path.exists(tmp_csv) else 0
-        print(f"\n  Resuming from UID index {start_idx:,} "
-              f"({rows_so_far:,} runs already saved)")
 
     print(f"\n[Step 2] Fetching runinfo ({len(uids):,} UIDs, "
           f"batches of {RUNINFO_BATCH}) ...")
 
-    pbar = tqdm(total=len(uids), initial=start_idx,
-                desc="  runinfo UIDs", unit="uid")
-
-    for i in range(start_idx, len(uids), RUNINFO_BATCH):
-        batch  = uids[i : i + RUNINFO_BATCH]
+    def fetch_uid_batch(batch: list[str]) -> pd.DataFrame:
         params = {
             "db": "sra", "id": ",".join(batch),
             "rettype": "runinfo", "retmode": "text",
@@ -440,51 +636,34 @@ def _fetch_runinfo(uids: list[str], checkpoint_file: str,
         if api_key:
             params["api_key"] = api_key
 
-        try:
-            resp     = _get(EFETCH_URL, params)
-            df_batch = pd.read_csv(
-                io.StringIO(resp.text),
-                engine="python",
-                on_bad_lines="skip",
-            ).dropna(how="all")
-            mask     = df_batch["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
-            df_batch = df_batch[mask]
-            if not df_batch.empty:
-                header = not os.path.exists(tmp_csv)
-                df_batch.to_csv(tmp_csv, mode="a", header=header, index=False)
-        except Exception as exc:
-            tqdm.write(f"  WARNING: batch at index {i} failed — {exc}")
+        resp = _get(EFETCH_URL, params)
+        return pd.read_csv(
+            io.StringIO(resp.text),
+            engine="python",
+            on_bad_lines="skip",
+        )
 
-        time.sleep(sleep)
-        pbar.update(len(batch))
-
-        with open(checkpoint_file, "w") as fh:
-            json.dump({"next_idx": i + RUNINFO_BATCH}, fh)
-
-    pbar.close()
-
-    for f in (checkpoint_file, ):
-        if os.path.exists(f):
-            os.remove(f)
-
-    if not os.path.exists(tmp_csv):
-        sys.exit("No WGS/METAGENOMIC runs found.")
-
-    df = (pd.read_csv(tmp_csv)
-            .drop_duplicates(subset=["Run"])
-            .reset_index(drop=True))
-    os.remove(tmp_csv)
-
+    df = _stream_runinfo_to_disk(
+        items=uids,
+        tmp_csv=tmp_csv,
+        checkpoint_file=checkpoint_file,
+        fetch_fn=fetch_uid_batch,
+        sleep=sleep,
+        desc="  runinfo UIDs",
+        unit="uid",
+        batch_size=RUNINFO_BATCH,
+        target_strategies=target_strategies,
+    )
     if df.empty:
-        sys.exit("No WGS/METAGENOMIC runs found.")
+        sys.exit(f"No runs found for strategies: {strategy_label(target_strategies)}.")
 
-    print(f"  WGS/METAGENOMIC runs: {len(df):,}")
+    print(f"  Runs matching strategy filter ({strategy_label(target_strategies)}): {len(df):,}")
     return df
 
 
-def _fetch_sra_runinfo(accession: str) -> pd.DataFrame:
+def _fetch_sra_runinfo(accession: str) -> pd.DataFrame | None:
     """Fetch SRA runinfo from the SRA Run Selector backend."""
-    print(f"\n[Step 1] Fetching SRA runinfo for {accession} ...")
+    print(f"  Fetching SRA runinfo for {accession} ...")
     for attempt in range(5):
         try:
             resp = requests.get(
@@ -559,6 +738,7 @@ def cmd_fetch_data(args: argparse.Namespace) -> None:
     bioprojects = load_bioproject_list(args.bioproject or [])
     sra_accs    = load_bioproject_list(args.accession  or [])
     keywords    = args.keyword    or []
+    strategies  = parse_strategy_values(args.strategy)
 
     if not taxon_ids and not bioprojects and not sra_accs and not keywords:
         sys.exit("[ERROR] Provide at least one --taxon ID, --bioproject accession, "
@@ -575,15 +755,15 @@ def cmd_fetch_data(args: argparse.Namespace) -> None:
     # ── taxon IDs ─────────────────────────────────────────────────────
     for taxon_id in taxon_ids:
         out_csv = args.merge_into if args.merge_into else f"sra_taxid{taxon_id}.csv"
-        ckpt    = f"sra_taxid{taxon_id}_checkpoint.json"
+        ckpt    = f"sra_taxid{taxon_id}{strategy_slug(strategies)}_checkpoint.json"
 
         print("=" * 60)
         print(f"  fetch-data (taxon)  —  taxon {taxon_id}")
-        print(f"  strategies          :  {', '.join(sorted(TARGET_STRATEGIES))}")
+        print(f"  strategies          :  {strategy_label(strategies, sep=', ')}")
         print("=" * 60)
 
         uids    = _search_sra_uids(taxon_id, api_key)
-        df_runs = _fetch_runinfo(uids, ckpt, api_key, sleep)
+        df_runs = _fetch_runinfo(uids, ckpt, api_key, sleep, strategies)
         df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
         if df_runs.empty:
             print(f"  No runs remaining after size filter for taxon {taxon_id} — skipping.")
@@ -617,21 +797,24 @@ def cmd_fetch_data(args: argparse.Namespace) -> None:
 
         print("=" * 60)
         print(f"  fetch-data (project)  —  {accession}")
+        print(f"  strategies            :  {strategy_label(strategies, sep=', ')}")
         print("=" * 60)
 
-        df_runs = _fetch_sra_runinfo(accession)
-        if df_runs is None:
-            sys.exit(f"[ERROR] No SRA data for {accession}. "
-                     "Check the accession is valid and has public data.")
-
-        if "LibraryStrategy" in df_runs.columns:
-            n_before = len(df_runs)
-            mask     = df_runs["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
-            df_runs  = df_runs[mask].reset_index(drop=True)
-            print(f"  Strategy filter ({'/'.join(sorted(TARGET_STRATEGIES))}): "
-                  f"{len(df_runs):,} / {n_before:,} runs")
+        print(f"\n[Step 2] Fetching SRA runs for {accession} ...")
+        ckpt = f"{accession}_sra_runs{strategy_slug(strategies)}_checkpoint.json"
+        tmp_csv = ckpt.replace("_checkpoint.json", "_partial.csv")
+        df_runs = _stream_runinfo_to_disk(
+            items=[accession],
+            tmp_csv=tmp_csv,
+            checkpoint_file=ckpt,
+            fetch_fn=_fetch_sra_runinfo,
+            sleep=sleep,
+            desc="  BioProject runs",
+            unit="project",
+            target_strategies=strategies,
+        )
         if df_runs.empty:
-            print(f"  No WGS/METAGENOMIC runs for {accession} — skipping.")
+            print(f"  No runs for {accession} with strategies: {strategy_label(strategies)} — skipping.")
             continue
 
         df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
@@ -672,21 +855,24 @@ def cmd_fetch_data(args: argparse.Namespace) -> None:
 
         print("=" * 60)
         print(f"  fetch-data (accession)  —  {accession}")
+        print(f"  strategies              :  {strategy_label(strategies, sep=', ')}")
         print("=" * 60)
 
-        df_runs = _fetch_sra_runinfo(accession)
-        if df_runs is None:
-            print(f"  WARNING: No SRA data returned for {accession} — skipping.")
-            continue
-
-        if "LibraryStrategy" in df_runs.columns:
-            n_before = len(df_runs)
-            mask     = df_runs["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
-            df_runs  = df_runs[mask].reset_index(drop=True)
-            print(f"  Strategy filter ({'/'.join(sorted(TARGET_STRATEGIES))}): "
-                  f"{len(df_runs):,} / {n_before:,} runs")
+        print(f"\n[Step 2] Fetching SRA runs for {accession} ...")
+        ckpt = f"sra_acc_{accession}{strategy_slug(strategies)}_checkpoint.json"
+        tmp_csv = ckpt.replace("_checkpoint.json", "_partial.csv")
+        df_runs = _stream_runinfo_to_disk(
+            items=[accession],
+            tmp_csv=tmp_csv,
+            checkpoint_file=ckpt,
+            fetch_fn=_fetch_sra_runinfo,
+            sleep=sleep,
+            desc="  accession runs",
+            unit="accession",
+            target_strategies=strategies,
+        )
         if df_runs.empty:
-            print(f"  No WGS/METAGENOMIC runs for {accession} — skipping.")
+            print(f"  No runs for {accession} with strategies: {strategy_label(strategies)} — skipping.")
             continue
 
         df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
@@ -727,7 +913,7 @@ def cmd_fetch_data(args: argparse.Namespace) -> None:
 
         print("=" * 60)
         print(f"  fetch-data (keyword)  —  {keyword!r}")
-        print(f"  strategies            :  {', '.join(sorted(TARGET_STRATEGIES))}")
+        print(f"  strategies            :  {strategy_label(strategies, sep=', ')}")
         print("=" * 60)
 
         bp_accs = _search_bioproject_by_keyword(keyword, api_key)
@@ -736,25 +922,25 @@ def cmd_fetch_data(args: argparse.Namespace) -> None:
             continue
 
         print(f"\n[Step 2] Fetching SRA runs for {len(bp_accs):,} BioProjects ...")
-        all_runs: list[pd.DataFrame] = []
-        for acc in tqdm(bp_accs, desc="  BioProject runs", unit="project"):
-            df_bp = _fetch_sra_runinfo(acc)
-            if df_bp is None:
-                continue
-            if "LibraryStrategy" in df_bp.columns:
-                mask  = df_bp["LibraryStrategy"].str.upper().isin(TARGET_STRATEGIES)
-                df_bp = df_bp[mask]
-            if not df_bp.empty:
-                all_runs.append(df_bp)
+        ckpt = f"sra_kw_{safe}{strategy_slug(strategies)}_checkpoint.json"
+        tmp_csv = ckpt.replace("_checkpoint.json", "_partial.csv")
+        df_runs = _stream_runinfo_to_disk(
+            items=bp_accs,
+            tmp_csv=tmp_csv,
+            checkpoint_file=ckpt,
+            fetch_fn=_fetch_sra_runinfo,
+            sleep=sleep,
+            desc="  BioProject runs",
+            unit="project",
+            target_strategies=strategies,
+        )
 
-        if not all_runs:
-            print(f"  No WGS/METAGENOMIC runs found for keyword {keyword!r}")
+        if df_runs.empty:
+            print(f"  No runs found for keyword {keyword!r} with strategies: "
+                  f"{strategy_label(strategies)}")
             continue
 
-        df_runs = (pd.concat(all_runs, ignore_index=True)
-                     .drop_duplicates(subset=["Run"])
-                     .reset_index(drop=True))
-        print(f"  WGS/METAGENOMIC runs collected: {len(df_runs):,}")
+        print(f"  Runs collected for strategies ({strategy_label(strategies)}): {len(df_runs):,}")
         df_runs = _apply_bases_filter(df_runs, args.min_bases, args.max_bases)
         if df_runs.empty:
             print(f"  No runs remaining after size filter for keyword {keyword!r} — skipping.")
@@ -1200,6 +1386,14 @@ def main():
     fd.add_argument("--keyword",     nargs="+", default=[], metavar="QUERY",
                     help="Free-text keyword query/queries. Supports NCBI query syntax, "
                          "e.g. --keyword \"pig gut metagenome\" ")
+    fd.add_argument("--strategy", "--library-strategy",
+                    nargs="+",
+                    default=list(sorted(DEFAULT_TARGET_STRATEGIES)),
+                    metavar="STRATEGY",
+                    help="SRA LibraryStrategy value(s) to keep (default: WGS METAGENOMIC). "
+                         "Examples: --strategy AMPLICON for 16S/marker-gene amplicons; "
+                         "--strategy WGS AMPLICON; --strategy all to disable filtering. "
+                         "Comma-separated values are also accepted.")
     fd.add_argument("--merge-into", default=None, metavar="CSV",
                     help="Output CSV file for all results. If the file already exists, "
                          "new runs are appended and deduplicated on Run ID. ")
